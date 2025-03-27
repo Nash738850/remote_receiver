@@ -17,6 +17,7 @@ CONF_RMT_CHANNEL = "rmt_channel"
 
 AUTO_LOAD = ["remote_base"]
 remote_receiver_ns = cg.esphome_ns.namespace("remote_receiver")
+ToleranceMode = cg.global_ns.namespace("esphome::remote_base").enum("ToleranceMode")
 RemoteReceiverComponent = remote_receiver_ns.class_(
     "RemoteReceiverComponent", remote_base.RemoteReceiverBase, cg.Component
 )
