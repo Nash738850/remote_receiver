@@ -61,7 +61,7 @@ async def to_code(config):
     await remote_base.build_triggers(config)
     await cg.register_component(var, config)
 
-    cg.add(var.set_tolerance(config[CONF_TOLERANCE], cg.global_ns.namespace("esphome::remote_base").enum("ToleranceMode").TOLERANCE_PERCENTAGE))
+    cg.add(var.set_tolerance(config[CONF_TOLERANCE], ToleranceMode.TOLERANCE_MODE_PERCENTAGE))
     cg.add(var.set_buffer_size(config[CONF_BUFFER_SIZE]))
     cg.add(var.set_filter_us(config[CONF_FILTER]))
     cg.add(var.set_idle_us(config[CONF_IDLE]))
