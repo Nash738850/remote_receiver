@@ -118,4 +118,35 @@ void RemoteReceiverComponent::decode_rmt_(const rmt_symbol_word_t *sym, size_t l
 
   this->temp_.reserve(len * 2);  // two halves per symbol
 
-  for (si
+  for (size_t i = 0; i < len; i++) {
+    // Half A
+    if (sym[i].duration0) {
+      if ((bool) sym[i].level0 == prev_level) {
+        prev_len += sym[i].duration0;
+      } else {
+        if (prev_len) this->temp_.push_back((prev_level ? 1 : -1) * (int32_t) prev_len * mult);
+        prev_level = (bool) sym[i].level0;
+        prev_len = sym[i].duration0;
+      }
+    }
+    // Half B
+    if (sym[i].duration1) {
+      if ((bool) sym[i].level1 == prev_level) {
+        prev_len += sym[i].duration1;
+      } else {
+        if (prev_len) this->temp_.push_back((prev_level ? 1 : -1) * (int32_t) prev_len * mult);
+        prev_level = (bool) sym[i].level1;
+        prev_len = sym[i].duration1;
+      }
+    }
+  }
+
+  if (prev_len) {
+    this->temp_.push_back((prev_level ? 1 : -1) * (int32_t) prev_len * mult);
+  }
+}
+
+}  // namespace remote_receiver
+}  // namespace esphome
+
+#endif  // USE_ESP32
