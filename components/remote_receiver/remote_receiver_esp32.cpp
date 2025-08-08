@@ -22,38 +22,34 @@ static bool IRAM_ATTR rmt_rx_callback(rmt_channel_handle_t,
 }
 
 void RemoteReceiverComponent::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up Remote Receiver (ESP-IDF 5 API)...");
+  ESP_LOGCONFIG(TAG, "Setting up Remote Receiver (ESP-IDF 5 RMT v2)...");
   this->pin_->setup();
 
-  // Create RX channel config (assign fields explicitly to avoid designator-order issues)
+  // Configure RX channel (explicit field assignment to appease 5.3.x)
   rmt_rx_channel_config_t rx_cfg{};
   rx_cfg.gpio_num = (gpio_num_t) this->pin_->get_pin();
   rx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
-  rx_cfg.resolution_hz = 1000000;      // 1 tick = 1 us
-  rx_cfg.mem_block_symbols = 256;      // tune if needed
-  // rx_cfg.flags.with_dma defaults to false
-  // No invert_in in ESP-IDF 5.3.x; inversion handled in software via pin_->is_inverted()
+  rx_cfg.resolution_hz = 1000000;    // 1 tick = 1 µs
+  rx_cfg.mem_block_symbols = 256;    // tune as needed
+  // rx_cfg.flags: leave defaults; no invert_in in 5.3.x (we handle inversion in software)
 
-  // Create RX channel
   esp_err_t err = rmt_new_rx_channel(&rx_cfg, &this->rx_channel_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "rmt_new_rx_channel failed: %s", esp_err_to_name(err));
-    this->mark_failed();
     this->error_code_ = err;
+    this->mark_failed();
     return;
   }
 
-  // Queue for RX events
+  // Create queue & register callback
   this->rx_queue_ = xQueueCreate(4, sizeof(rmt_rx_done_event_data_t));
-
-  // Register callback
   rmt_rx_event_callbacks_t cbs{};
   cbs.on_recv_done = rmt_rx_callback;
   err = rmt_rx_register_event_callbacks(this->rx_channel_, &cbs, this->rx_queue_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "rmt_rx_register_event_callbacks failed: %s", esp_err_to_name(err));
-    this->mark_failed();
     this->error_code_ = err;
+    this->mark_failed();
     return;
   }
 
@@ -61,8 +57,8 @@ void RemoteReceiverComponent::setup() {
   err = rmt_enable(this->rx_channel_);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "rmt_enable failed: %s", esp_err_to_name(err));
-    this->mark_failed();
     this->error_code_ = err;
+    this->mark_failed();
     return;
   }
 
@@ -74,8 +70,8 @@ void RemoteReceiverComponent::setup() {
   err = rmt_receive(this->rx_channel_, nullptr, 0, &rx_conf);
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "rmt_receive start failed: %s", esp_err_to_name(err));
-    this->mark_failed();
     this->error_code_ = err;
+    this->mark_failed();
     return;
   }
 }
@@ -84,7 +80,7 @@ void RemoteReceiverComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "Remote Receiver:");
   LOG_PIN("  Pin: ", this->pin_);
   if (this->pin_->digital_read()) {
-    ESP_LOGW(TAG, "Signal starts HIGH. If decoding is inverted, use 'inverted: true' on the pin.");
+    ESP_LOGW(TAG, "Signal starts HIGH. If decoding seems inverted, use 'inverted: true' on the pin.");
   }
   ESP_LOGCONFIG(TAG, "  Buffer Size: %u", this->buffer_size_);
   ESP_LOGCONFIG(TAG, "  Tolerance: %u%%", this->tolerance_);
@@ -96,12 +92,11 @@ void RemoteReceiverComponent::dump_config() {
 }
 
 void RemoteReceiverComponent::loop() {
-  if (!this->rx_channel_ || !this->rx_queue_)
-    return;
+  if (!this->rx_channel_ || !this->rx_queue_) return;
 
   rmt_rx_done_event_data_t evt;
   if (xQueueReceive(this->rx_queue_, &evt, 0) == pdTRUE) {
-    // evt.received_symbols -> rmt_symbol_word_t[], length in evt.num_symbols
+    // Convert symbols to pulse list used by RemoteReceiverBase
     this->decode_rmt_(evt.received_symbols, evt.num_symbols);
 
     if (!this->temp_.empty()) {
@@ -123,7 +118,6 @@ void RemoteReceiverComponent::decode_rmt_(const rmt_symbol_word_t *sym, size_t l
   this->temp_.clear();
   const int32_t mult = this->pin_->is_inverted() ? -1 : 1;
 
-  ESP_LOGVV(TAG, "START:");
   this->temp_.reserve(len * 2);  // two halves per symbol
 
   for (size_t i = 0; i < len; i++) {
