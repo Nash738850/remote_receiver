@@ -1,69 +1,45 @@
 #pragma once
 
 #include "esphome/core/component.h"
-#include "esphome/components/remote_base/remote_base.h"
+#include "esphome/core/hal.h"
+
+#ifdef USE_ESP32
+#include "driver/rmt_rx.h"
+#endif
 
 namespace esphome {
 namespace remote_receiver {
 
-#ifdef USE_ESP8266
-struct RemoteReceiverComponentStore {
-  static void gpio_intr(RemoteReceiverComponentStore *arg);
-
-  volatile uint32_t *buffer{nullptr};
-  volatile uint32_t buffer_write_at;
-  uint32_t buffer_read_at{0};
-  bool overflow{false};
-  uint32_t buffer_size{1000};
-  uint8_t filter_us{10};
-  ISRInternalGPIOPin pin;
-};
-#endif
-
-class RemoteReceiverComponent : public remote_base::RemoteReceiverBase,
-                                public Component
-#ifdef USE_ESP32
-    ,
-                                public remote_base::RemoteRMTChannel
-#endif
-{
+class RemoteReceiverComponent : public Component {
  public:
-#ifdef USE_ESP32
-  RemoteReceiverComponent(InternalGPIOPin *pin, uint8_t mem_block_num = 1)
-      : RemoteReceiverBase(pin), remote_base::RemoteRMTChannel(mem_block_num) {}
-#else
-  RemoteReceiverComponent(InternalGPIOPin *pin) : RemoteReceiverBase(pin) {}
-#endif
+  // Constructor
+  explicit RemoteReceiverComponent(InternalGPIOPin *pin);
+
   void setup() override;
-  void dump_config() override;
   void loop() override;
-  float get_setup_priority() const override { return setup_priority::DATA; }
+  void dump_config() override;
 
-  void set_buffer_size(uint32_t buffer_size) { this->buffer_size_ = buffer_size; }
-  void set_filter_us(uint8_t filter_us) { this->filter_us_ = filter_us; }
-  void set_idle_us(uint32_t idle_us) { this->idle_us_ = idle_us; }
-
-#ifdef USE_ESP32
+  // Set RMT channel manually (optional)
   void set_rmt_channel(uint8_t channel) { this->rmt_channel_ = channel; }
-#endif
+
+  // Settings
+  void set_buffer_size(uint16_t size) { this->buffer_size_ = size; }
+  void set_tolerance(uint8_t tolerance) { this->tolerance_ = tolerance; }
+  void set_filter_us(uint32_t filter) { this->filter_us_ = filter; }
+  void set_idle_us(uint32_t idle) { this->idle_us_ = idle; }
 
  protected:
+  InternalGPIOPin *pin_;
+
 #ifdef USE_ESP32
-  void decode_rmt_(rmt_item32_t *item, size_t len);
-  RingbufHandle_t ringbuf_;
-  esp_err_t error_code_{ESP_OK};
-  rmt_channel_t override_rmt_channel;
+  rmt_channel_handle_t rmt_channel_handle_{nullptr};
+#endif
+
   uint8_t rmt_channel_{255};  // 255 = auto
-#endif
-
-#ifdef USE_ESP8266
-  RemoteReceiverComponentStore store_;
-  HighFrequencyLoopRequester high_freq_;
-#endif
-
-  uint32_t buffer_size_{};
-  uint8_t filter_us_{10};
-  uint32_t idle_us_{10000};
+  uint16_t buffer_size_{10000};
+  uint8_t tolerance_{25};
+  uint32_t filter_us_{200};
+  uint32_t idle_us_{25000};
 };
 
 }  // namespace remote_receiver
