@@ -24,18 +24,22 @@ void RemoteReceiverComponent::setup() {
       },
   };
 
-  // Handle RMT channel allocation manually
-  esp_err_t err = ESP_FAIL;
+  esp_err_t err;
   rmt_channel_handle_t rx_channel = NULL;
 
-  // First try auto-allocation
-  err = rmt_new_rx_channel(&rx_config, &rx_channel);
-  if (err == ESP_ERR_NOT_FOUND) {
-    ESP_LOGW(TAG, "Auto channel allocation failed, retrying with channel 0");
-    // Force channel 0
-    rmt_del_channel(rx_channel);
-    rx_config.flags.reserved = RMT_CHANNEL_0;  // explicitly request channel 0
+  if (this->rmt_channel_ != 255) {
+    // Force specific channel
+    ESP_LOGI(TAG, "Requesting fixed RMT channel %u", this->rmt_channel_);
+    rx_config.flags.reserved = (rmt_channel_t) this->rmt_channel_;
     err = rmt_new_rx_channel(&rx_config, &rx_channel);
+  } else {
+    // Try auto-alloc first
+    err = rmt_new_rx_channel(&rx_config, &rx_channel);
+    if (err == ESP_ERR_NOT_FOUND) {
+      ESP_LOGW(TAG, "Auto channel allocation failed, forcing channel 0");
+      rx_config.flags.reserved = RMT_CHANNEL_0;
+      err = rmt_new_rx_channel(&rx_config, &rx_channel);
+    }
   }
 
   if (err != ESP_OK) {
@@ -44,7 +48,6 @@ void RemoteReceiverComponent::setup() {
     return;
   }
 
-  // Configure receive parameters
   rmt_receive_config_t receive_config = {
       .signal_range_min_ns = (uint32_t) this->filter_us_ * 1000,
       .signal_range_max_ns = (uint32_t) this->idle_us_ * 1000,
@@ -96,6 +99,8 @@ void RemoteReceiverComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "  Tolerance: %u%%", this->tolerance_);
   ESP_LOGCONFIG(TAG, "  Filter (min pulse): %u us", this->filter_us_);
   ESP_LOGCONFIG(TAG, "  Idle after: %u us", this->idle_us_);
+  if (this->rmt_channel_ != 255)
+    ESP_LOGCONFIG(TAG, "  Forced RMT Channel: %u", this->rmt_channel_);
 }
 
 void RemoteReceiverComponent::decode_rmt_(rmt_item32_t *item, size_t len) {
