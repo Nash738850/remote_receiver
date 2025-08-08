@@ -1,77 +1,65 @@
 #include "remote_receiver.h"
 #include "esphome/core/log.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/hal.h"
 
 #ifdef USE_ESP32
-#include "driver/rmt_rx.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
 
 namespace esphome {
 namespace remote_receiver {
 
 static const char *const TAG = "remote_receiver.esp32";
 
-// ISR callback: push RX-done event into our queue
-static bool IRAM_ATTR rmt_rx_callback(rmt_channel_handle_t,
-                                      const rmt_rx_done_event_data_t *edata,
-                                      void *user_data) {
-  auto q = static_cast<QueueHandle_t>(user_data);
-  BaseType_t hp_wakeup = pdFALSE;
-  xQueueSendFromISR(q, edata, &hp_wakeup);
-  return hp_wakeup == pdTRUE;
+void IRAM_ATTR HOT RemoteReceiverComponentStore::gpio_intr(RemoteReceiverComponentStore *arg) {
+  const uint32_t now = micros();
+  // Next index (wrap)
+  const uint32_t next = (arg->buffer_write_at + 1) % arg->buffer_size;
+  const bool level = arg->pin.digital_read();
+
+  // We encode: even index => falling, odd index => rising.
+  // If level doesn't match the next index parity, ignore (spurious)
+  if (level != (next % 2))
+    return;
+
+  // Overflow guard
+  if (next == arg->buffer_read_at)
+    return;
+
+  const uint32_t last_change = arg->buffer[arg->buffer_write_at];
+  const uint32_t dt = now - last_change;
+  if (dt <= arg->filter_us)
+    return;
+
+  arg->buffer[arg->buffer_write_at = next] = now;
 }
 
 void RemoteReceiverComponent::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up Remote Receiver (ESP-IDF 5 RMT v2)...");
+  ESP_LOGCONFIG(TAG, "Setting up Remote Receiver (GPIO-ISR, no RMT)...");
   this->pin_->setup();
 
-  // Configure RX channel (explicit assignments to satisfy 5.3.x)
-  rmt_rx_channel_config_t rx_cfg{};
-  rx_cfg.gpio_num = (gpio_num_t) this->pin_->get_pin();
-  rx_cfg.clk_src = RMT_CLK_SRC_DEFAULT;
-  rx_cfg.resolution_hz = 1000000;   // 1 tick = 1 µs
-  rx_cfg.mem_block_symbols = 256;   // tune if needed
+  auto &s = this->store_;
+  s.filter_us = this->filter_us_;
+  s.pin = this->pin_->to_isr();
+  s.buffer_size = this->buffer_size_;
 
-  esp_err_t err = rmt_new_rx_channel(&rx_cfg, &this->rx_channel_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "rmt_new_rx_channel failed: %s", esp_err_to_name(err));
-    this->error_code_ = err;
-    this->mark_failed();
-    return;
+  this->high_freq_.start();
+
+  if (s.buffer_size % 2 != 0) {
+    // Make divisible by two (even indices = spaces, odd = marks)
+    s.buffer_size++;
   }
 
-  // Queue & callback
-  this->rx_queue_ = xQueueCreate(4, sizeof(rmt_rx_done_event_data_t));
-  rmt_rx_event_callbacks_t cbs{};
-  cbs.on_recv_done = rmt_rx_callback;
-  err = rmt_rx_register_event_callbacks(this->rx_channel_, &cbs, this->rx_queue_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "rmt_rx_register_event_callbacks failed: %s", esp_err_to_name(err));
-    this->error_code_ = err;
-    this->mark_failed();
-    return;
+  s.buffer = new uint32_t[s.buffer_size];
+  memset((void *) s.buffer, 0, s.buffer_size * sizeof(uint32_t));
+
+  // First index depends on current level; we want index parity to reflect level
+  if (this->pin_->digital_read()) {
+    s.buffer_write_at = s.buffer_read_at = 1;  // rising/high at start -> odd
+  } else {
+    s.buffer_write_at = s.buffer_read_at = 0;  // low at start -> even
   }
 
-  // Enable & arm
-  err = rmt_enable(this->rx_channel_);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "rmt_enable failed: %s", esp_err_to_name(err));
-    this->error_code_ = err;
-    this->mark_failed();
-    return;
-  }
-
-  rmt_receive_config_t rx_conf{};
-  rx_conf.signal_range_min_ns = (uint32_t) (this->filter_us_ * 1000ULL);
-  rx_conf.signal_range_max_ns = (uint32_t) (this->idle_us_   * 1000ULL);
-
-  err = rmt_receive(this->rx_channel_, nullptr, 0, &rx_conf);
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "rmt_receive start failed: %s", esp_err_to_name(err));
-    this->error_code_ = err;
-    this->mark_failed();
-    return;
-  }
+  this->pin_->attach_interrupt(RemoteReceiverComponentStore::gpio_intr, &this->store_, gpio::INTERRUPT_ANY_EDGE);
 }
 
 void RemoteReceiverComponent::dump_config() {
@@ -82,68 +70,64 @@ void RemoteReceiverComponent::dump_config() {
   }
   ESP_LOGCONFIG(TAG, "  Buffer Size: %u", this->buffer_size_);
   ESP_LOGCONFIG(TAG, "  Tolerance: %u%%", this->tolerance_);
-  ESP_LOGCONFIG(TAG, "  Filter (min pulse): %u us", this->filter_us_);
-  ESP_LOGCONFIG(TAG, "  Idle after: %u us", this->idle_us_);
-  if (this->is_failed()) {
-    ESP_LOGE(TAG, "RMT init failed: %s", esp_err_to_name(this->error_code_));
-  }
+  ESP_LOGCONFIG(TAG, "  Filter out pulses shorter than: %u us", this->filter_us_);
+  ESP_LOGCONFIG(TAG, "  Signal is done after %u us of no changes", this->idle_us_);
 }
 
 void RemoteReceiverComponent::loop() {
-  if (!this->rx_channel_ || !this->rx_queue_) return;
+  auto &s = this->store_;
 
-  rmt_rx_done_event_data_t evt;
-  if (xQueueReceive(this->rx_queue_, &evt, 0) == pdTRUE) {
-    // Convert symbols to pulses used by RemoteReceiverBase
-    this->decode_rmt_(evt.received_symbols, evt.num_symbols);
+  // Snapshot write pointer (volatile)
+  const uint32_t write_at = s.buffer_write_at;
+  const uint32_t dist = (s.buffer_size + write_at - s.buffer_read_at) % s.buffer_size;
 
-    if (!this->temp_.empty()) {
-      this->temp_.push_back(-this->idle_us_);
-      this->call_listeners_dumpers_();
-    }
+  // Need at least one rising & one falling edge
+  if (dist <= 1)
+    return;
 
-    // Re-arm
-    rmt_receive_config_t rx_conf{};
-    rx_conf.signal_range_min_ns = (uint32_t) (this->filter_us_ * 1000ULL);
-    rx_conf.signal_range_max_ns = (uint32_t) (this->idle_us_   * 1000ULL);
-    (void) rmt_receive(this->rx_channel_, nullptr, 0, &rx_conf);
+  const uint32_t now = micros();
+  if (now - s.buffer[write_at] < this->idle_us_) {
+    // Not idle long enough yet
+    return;
   }
-}
 
-void RemoteReceiverComponent::decode_rmt_(const rmt_symbol_word_t *sym, size_t len) {
-  bool prev_level = false;
-  uint32_t prev_len = 0;
+  ESP_LOGVV(TAG, "read_at=%u write_at=%u dist=%u now=%u end=%u",
+            s.buffer_read_at, write_at, dist, now, s.buffer[write_at]);
+
+  // Skip first value (belongs to previous idle level)
+  s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
+  uint32_t prev = s.buffer_read_at;
+  s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
+
+  const uint32_t reserve = 1 + (s.buffer_size + write_at - s.buffer_read_at) % s.buffer_size;
   this->temp_.clear();
-  const int32_t mult = this->pin_->is_inverted() ? -1 : 1;
+  this->temp_.reserve(reserve);
 
-  this->temp_.reserve(len * 2);  // two halves per symbol
+  // Determine sign based on starting index parity (even=space -> positive; odd=mark -> negative)
+  int32_t multiplier = (s.buffer_read_at % 2 == 0) ? 1 : -1;
 
-  for (size_t i = 0; i < len; i++) {
-    // Half A
-    if (sym[i].duration0) {
-      if ((bool) sym[i].level0 == prev_level) {
-        prev_len += sym[i].duration0;
-      } else {
-        if (prev_len) this->temp_.push_back((prev_level ? 1 : -1) * (int32_t) prev_len * mult);
-        prev_level = (bool) sym[i].level0;
-        prev_len = sym[i].duration0;
-      }
+  for (uint32_t i = 0; prev != write_at; i++) {
+    int32_t delta = s.buffer[s.buffer_read_at] - s.buffer[prev];
+    if (uint32_t(delta) >= this->idle_us_) {
+      // Long space => frame ended already
+      break;
     }
-    // Half B
-    if (sym[i].duration1) {
-      if ((bool) sym[i].level1 == prev_level) {
-        prev_len += sym[i].duration1;
-      } else {
-        if (prev_len) this->temp_.push_back((prev_level ? 1 : -1) * (int32_t) prev_len * mult);
-        prev_level = (bool) sym[i].level1;
-        prev_len = sym[i].duration1;
-      }
-    }
+
+    ESP_LOGVV(TAG, "  i=%u buffer[%u]=%u - buffer[%u]=%u -> %d",
+              i, s.buffer_read_at, s.buffer[s.buffer_read_at], prev, s.buffer[prev], multiplier * delta);
+
+    this->temp_.push_back(multiplier * delta);
+    prev = s.buffer_read_at;
+    s.buffer_read_at = (s.buffer_read_at + 1) % s.buffer_size;
+    multiplier *= -1;
   }
 
-  if (prev_len) {
-    this->temp_.push_back((prev_level ? 1 : -1) * (int32_t) prev_len * mult);
-  }
+  // Step one back and append idle separator
+  s.buffer_read_at = (s.buffer_size + s.buffer_read_at - 1) % s.buffer_size;
+  this->temp_.push_back(this->idle_us_ * multiplier);
+
+  // Notify protocol dumpers/listeners
+  this->call_listeners_dumpers_();
 }
 
 }  // namespace remote_receiver
