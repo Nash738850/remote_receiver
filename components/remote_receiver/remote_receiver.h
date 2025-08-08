@@ -4,7 +4,11 @@
 #include "esphome/components/remote_base/remote_base.h"
 
 #ifdef USE_ESP32
+// ESP-IDF 5 RMT RX API + FreeRTOS types for QueueHandle_t
 #include "driver/rmt_rx.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "esp_err.h"
 #endif
 
 namespace esphome {
@@ -14,6 +18,7 @@ namespace remote_receiver {
 struct RemoteReceiverComponentStore {
   static void gpio_intr(RemoteReceiverComponentStore *arg);
 
+  // Time (in µs) when each edge occurred
   volatile uint32_t *buffer{nullptr};
   volatile uint32_t buffer_write_at;
   uint32_t buffer_read_at{0};
@@ -28,7 +33,8 @@ class RemoteReceiverComponent : public remote_base::RemoteReceiverBase,
                                 public Component {
  public:
 #ifdef USE_ESP32
-  RemoteReceiverComponent(InternalGPIOPin *pin)
+  // Back-compat: keep the 2-arg ctor but ignore mem_block_num (not used in IDF5)
+  RemoteReceiverComponent(InternalGPIOPin *pin, uint8_t /*mem_block_num*/ = 1)
       : RemoteReceiverBase(pin) {}
 #else
   RemoteReceiverComponent(InternalGPIOPin *pin) : RemoteReceiverBase(pin) {}
@@ -43,8 +49,12 @@ class RemoteReceiverComponent : public remote_base::RemoteReceiverBase,
   void set_filter_us(uint8_t filter_us) { this->filter_us_ = filter_us; }
   void set_idle_us(uint32_t idle_us) { this->idle_us_ = idle_us; }
 
+  // Back-compat: old API exposed rmt_channel; no-op under IDF5
+  void set_rmt_channel(uint32_t) {}
+
  protected:
 #ifdef USE_ESP32
+  // New RMT v2 symbol type
   void decode_rmt_(const rmt_symbol_word_t *item, size_t len);
   rmt_channel_handle_t rx_channel_{nullptr};
   QueueHandle_t rx_queue_{nullptr};
@@ -56,7 +66,7 @@ class RemoteReceiverComponent : public remote_base::RemoteReceiverBase,
   HighFrequencyLoopRequester high_freq_;
 #endif
 
-  uint32_t buffer_size_{};
+  uint32_t buffer_size_{};    // kept for logging/compat only
   uint8_t filter_us_{10};
   uint32_t idle_us_{10000};
 };
