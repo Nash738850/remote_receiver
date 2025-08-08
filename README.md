@@ -9,7 +9,7 @@ The rmt_channel is 0 based. So to use the third channel, specify "rmt_channel: 2
 
 ```yaml
 external_components:
-  - source: github://Jorre05/remote_receiver
+  - source: github://nash738850/remote_receiver
     components: [ remote_receiver ]
 
 remote_receiver:
@@ -19,5 +19,3 @@ remote_receiver:
   rmt_channel: 2
   dump: all
 ```
-
-Ref: https://github.com/esphome/issues/issues/2934
