@@ -3,14 +3,6 @@
 #include "esphome/core/component.h"
 #include "esphome/components/remote_base/remote_base.h"
 
-#ifdef USE_ESP32
-// ESP-IDF 5 RMT RX API + FreeRTOS types for QueueHandle_t
-#include "driver/rmt_rx.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "esp_err.h"
-#endif
-
 namespace esphome {
 namespace remote_receiver {
 
@@ -18,7 +10,6 @@ namespace remote_receiver {
 struct RemoteReceiverComponentStore {
   static void gpio_intr(RemoteReceiverComponentStore *arg);
 
-  // Time (in µs) when each edge occurred
   volatile uint32_t *buffer{nullptr};
   volatile uint32_t buffer_write_at;
   uint32_t buffer_read_at{0};
@@ -30,16 +21,19 @@ struct RemoteReceiverComponentStore {
 #endif
 
 class RemoteReceiverComponent : public remote_base::RemoteReceiverBase,
-                                public Component {
+                                public Component
+#ifdef USE_ESP32
+    ,
+                                public remote_base::RemoteRMTChannel
+#endif
+{
  public:
 #ifdef USE_ESP32
-  // Back-compat: keep the 2-arg ctor but ignore mem_block_num (not used in IDF5)
-  RemoteReceiverComponent(InternalGPIOPin *pin, uint8_t /*mem_block_num*/ = 1)
-      : RemoteReceiverBase(pin) {}
+  RemoteReceiverComponent(InternalGPIOPin *pin, uint8_t mem_block_num = 1)
+      : RemoteReceiverBase(pin), remote_base::RemoteRMTChannel(mem_block_num) {}
 #else
   RemoteReceiverComponent(InternalGPIOPin *pin) : RemoteReceiverBase(pin) {}
 #endif
-
   void setup() override;
   void dump_config() override;
   void loop() override;
@@ -49,16 +43,17 @@ class RemoteReceiverComponent : public remote_base::RemoteReceiverBase,
   void set_filter_us(uint8_t filter_us) { this->filter_us_ = filter_us; }
   void set_idle_us(uint32_t idle_us) { this->idle_us_ = idle_us; }
 
-  // Back-compat: old API exposed rmt_channel; no-op under IDF5
-  void set_rmt_channel(uint32_t) {}
+#ifdef USE_ESP32
+  void set_rmt_channel(uint8_t channel) { this->rmt_channel_ = channel; }
+#endif
 
  protected:
 #ifdef USE_ESP32
-  // New RMT v2 symbol type
-  void decode_rmt_(const rmt_symbol_word_t *item, size_t len);
-  rmt_channel_handle_t rx_channel_{nullptr};
-  QueueHandle_t rx_queue_{nullptr};
+  void decode_rmt_(rmt_item32_t *item, size_t len);
+  RingbufHandle_t ringbuf_;
   esp_err_t error_code_{ESP_OK};
+  rmt_channel_t override_rmt_channel;
+  uint8_t rmt_channel_{255};  // 255 = auto
 #endif
 
 #ifdef USE_ESP8266
@@ -66,7 +61,7 @@ class RemoteReceiverComponent : public remote_base::RemoteReceiverBase,
   HighFrequencyLoopRequester high_freq_;
 #endif
 
-  uint32_t buffer_size_{};    // kept for logging/compat only
+  uint32_t buffer_size_{};
   uint8_t filter_us_{10};
   uint32_t idle_us_{10000};
 };
