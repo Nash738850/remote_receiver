@@ -2,149 +2,164 @@
 #include "esphome/core/log.h"
 
 #ifdef USE_ESP32
-#include <driver/rmt.h>
+#include "driver/rmt_rx.h"
 
 namespace esphome {
 namespace remote_receiver {
 
 static const char *const TAG = "remote_receiver.esp32";
 
+// Callback to handle RX events
+static bool IRAM_ATTR rmt_rx_callback(rmt_channel_handle_t channel,
+                                      const rmt_rx_done_event_data_t *edata,
+                                      void *user_data) {
+  auto queue = static_cast<QueueHandle_t>(user_data);
+  BaseType_t high_task_wakeup = pdFALSE;
+  // Send the received data to our queue
+  xQueueSendFromISR(queue, edata, &high_task_wakeup);
+  return high_task_wakeup == pdTRUE;
+}
+
 void RemoteReceiverComponent::setup() {
-  ESP_LOGCONFIG(TAG, "Setting up Remote Receiver...");
-  this->channel_ = override_rmt_channel;
+  ESP_LOGCONFIG(TAG, "Setting up Remote Receiver (ESP-IDF 5 API)...");
   this->pin_->setup();
-  rmt_config_t rmt{};
-  this->config_rmt(rmt);
-  rmt.gpio_num = gpio_num_t(this->pin_->get_pin());
-  rmt.rmt_mode = RMT_MODE_RX;
-  if (this->filter_us_ == 0) {
-    rmt.rx_config.filter_en = false;
-  } else {
-    rmt.rx_config.filter_en = true;
-    rmt.rx_config.filter_ticks_thresh = this->from_microseconds_(this->filter_us_);
-  }
-  rmt.rx_config.idle_threshold = this->from_microseconds_(this->idle_us_);
 
-  esp_err_t error = rmt_config(&rmt);
-  if (error != ESP_OK) {
-    this->error_code_ = error;
+  // Create RX channel config
+  rmt_rx_channel_config_t rx_cfg = {
+      .gpio_num = (gpio_num_t) this->pin_->get_pin(),
+      .clk_src = RMT_CLK_SRC_DEFAULT,
+      .resolution_hz = 1'000'000,  // 1 tick = 1us
+      .mem_block_symbols = 256,    // tune as needed
+      .invert_in = this->pin_->is_inverted(),
+      .flags = {}
+  };
+
+  this->error_code_ = rmt_new_rx_channel(&rx_cfg, &this->rx_channel_);
+  if (this->error_code_ != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to create RMT RX channel: %s", esp_err_to_name(this->error_code_));
     this->mark_failed();
     return;
   }
 
-  error = rmt_driver_install(this->channel_, this->buffer_size_, 0);
-  if (error != ESP_OK) {
-    this->error_code_ = error;
+  // Create queue for RX events
+  this->rx_queue_ = xQueueCreate(4, sizeof(rmt_rx_done_event_data_t));
+
+  // Register RX done callback
+  rmt_rx_event_callbacks_t cbs = {};
+  cbs.on_recv_done = rmt_rx_callback;
+  this->error_code_ = rmt_rx_register_event_callbacks(this->rx_channel_, &cbs, this->rx_queue_);
+  if (this->error_code_ != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to register RX callbacks: %s", esp_err_to_name(this->error_code_));
     this->mark_failed();
     return;
   }
-  error = rmt_get_ringbuf_handle(this->channel_, &this->ringbuf_);
-  if (error != ESP_OK) {
-    this->error_code_ = error;
+
+  // Enable channel
+  this->error_code_ = rmt_enable(this->rx_channel_);
+  if (this->error_code_ != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to enable RMT RX channel: %s", esp_err_to_name(this->error_code_));
     this->mark_failed();
     return;
   }
-  error = rmt_rx_start(this->channel_, true);
-  if (error != ESP_OK) {
-    this->error_code_ = error;
+
+  // Start receiving
+  rmt_receive_config_t rx_conf = {
+      .signal_range_min_ns = (uint32_t) (this->filter_us_ * 1000ULL),
+      .signal_range_max_ns = (uint32_t) (this->idle_us_ * 1000ULL)
+  };
+  this->error_code_ = rmt_receive(this->rx_channel_, nullptr, 0, &rx_conf);
+  if (this->error_code_ != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to start receiving: %s", esp_err_to_name(this->error_code_));
     this->mark_failed();
     return;
   }
 }
+
 void RemoteReceiverComponent::dump_config() {
   ESP_LOGCONFIG(TAG, "Remote Receiver:");
   LOG_PIN("  Pin: ", this->pin_);
   if (this->pin_->digital_read()) {
-    ESP_LOGW(TAG, "Remote Receiver Signal starts with a HIGH value. Usually this means you have to "
-                  "invert the signal using 'inverted: True' in the pin schema!");
+    ESP_LOGW(TAG, "Remote Receiver Signal starts HIGH. Try 'inverted: true' if decoding fails.");
   }
-  ESP_LOGCONFIG(TAG, "  Channel: %d", this->channel_);
-  ESP_LOGCONFIG(TAG, "  RMT memory blocks: %d", this->mem_block_num_);
-  ESP_LOGCONFIG(TAG, "  Clock divider: %u", this->clock_divider_);
+  ESP_LOGCONFIG(TAG, "  Buffer Size: %u", this->buffer_size_);
   ESP_LOGCONFIG(TAG, "  Tolerance: %u%%", this->tolerance_);
-  ESP_LOGCONFIG(TAG, "  Filter out pulses shorter than: %u us", this->filter_us_);
-  ESP_LOGCONFIG(TAG, "  Signal is done after %u us of no changes", this->idle_us_);
+  ESP_LOGCONFIG(TAG, "  Filter (min pulse): %u us", this->filter_us_);
+  ESP_LOGCONFIG(TAG, "  Idle after: %u us", this->idle_us_);
   if (this->is_failed()) {
-    ESP_LOGE(TAG, "Configuring RMT driver failed: %s", esp_err_to_name(this->error_code_));
+    ESP_LOGE(TAG, "RMT setup failed: %s", esp_err_to_name(this->error_code_));
   }
 }
 
 void RemoteReceiverComponent::loop() {
-  size_t len = 0;
-  auto *item = (rmt_item32_t *) xRingbufferReceive(this->ringbuf_, &len, 0);
-  if (item != nullptr) {
-    this->decode_rmt_(item, len);
-    vRingbufferReturnItem(this->ringbuf_, item);
+  if (!this->rx_channel_ || !this->rx_queue_) return;
 
-    if (this->temp_.empty())
-      return;
+  rmt_rx_done_event_data_t rx_data;
+  if (xQueueReceive(this->rx_queue_, &rx_data, 0) == pdTRUE) {
+    // Decode the received symbols
+    this->decode_rmt_(rx_data.received_symbols, rx_data.num_symbols);
 
-    this->temp_.push_back(-this->idle_us_);
-    this->call_listeners_dumpers_();
+    if (!this->temp_.empty()) {
+      this->temp_.push_back(-this->idle_us_);
+      this->call_listeners_dumpers_();
+    }
+
+    // Restart reception
+    rmt_receive_config_t rx_conf = {
+        .signal_range_min_ns = (uint32_t) (this->filter_us_ * 1000ULL),
+        .signal_range_max_ns = (uint32_t) (this->idle_us_ * 1000ULL)
+    };
+    rmt_receive(this->rx_channel_, nullptr, 0, &rx_conf);
   }
 }
-void RemoteReceiverComponent::decode_rmt_(rmt_item32_t *item, size_t len) {
+
+void RemoteReceiverComponent::decode_rmt_(const rmt_symbol_word_t *item, size_t len) {
   bool prev_level = false;
   uint32_t prev_length = 0;
   this->temp_.clear();
   int32_t multiplier = this->pin_->is_inverted() ? -1 : 1;
-  size_t item_count = len / sizeof(rmt_item32_t);
 
   ESP_LOGVV(TAG, "START:");
-  for (size_t i = 0; i < item_count; i++) {
+  for (size_t i = 0; i < len; i++) {
     if (item[i].level0) {
-      ESP_LOGVV(TAG, "%u A: ON %uus (%u ticks)", i, this->to_microseconds_(item[i].duration0), item[i].duration0);
+      ESP_LOGVV(TAG, "%u A: ON %uus", i, item[i].duration0);
     } else {
-      ESP_LOGVV(TAG, "%u A: OFF %uus (%u ticks)", i, this->to_microseconds_(item[i].duration0), item[i].duration0);
+      ESP_LOGVV(TAG, "%u A: OFF %uus", i, item[i].duration0);
     }
     if (item[i].level1) {
-      ESP_LOGVV(TAG, "%u B: ON %uus (%u ticks)", i, this->to_microseconds_(item[i].duration1), item[i].duration1);
+      ESP_LOGVV(TAG, "%u B: ON %uus", i, item[i].duration1);
     } else {
-      ESP_LOGVV(TAG, "%u B: OFF %uus (%u ticks)", i, this->to_microseconds_(item[i].duration1), item[i].duration1);
+      ESP_LOGVV(TAG, "%u B: OFF %uus", i, item[i].duration1);
     }
   }
-  ESP_LOGVV(TAG, "\n");
 
-  this->temp_.reserve(item_count * 2);  // each RMT item has 2 pulses
-  for (size_t i = 0; i < item_count; i++) {
+  this->temp_.reserve(len * 2);
+  for (size_t i = 0; i < len; i++) {
     if (item[i].duration0 == 0u) {
-      // Do nothing
+      // skip
     } else if (bool(item[i].level0) == prev_level) {
       prev_length += item[i].duration0;
     } else {
       if (prev_length > 0) {
-        if (prev_level) {
-          this->temp_.push_back(this->to_microseconds_(prev_length) * multiplier);
-        } else {
-          this->temp_.push_back(-int32_t(this->to_microseconds_(prev_length)) * multiplier);
-        }
+        this->temp_.push_back((prev_level ? 1 : -1) * int32_t(prev_length) * multiplier);
       }
       prev_level = bool(item[i].level0);
       prev_length = item[i].duration0;
     }
 
     if (item[i].duration1 == 0u) {
-      // Do nothing
+      // skip
     } else if (bool(item[i].level1) == prev_level) {
       prev_length += item[i].duration1;
     } else {
       if (prev_length > 0) {
-        if (prev_level) {
-          this->temp_.push_back(this->to_microseconds_(prev_length) * multiplier);
-        } else {
-          this->temp_.push_back(-int32_t(this->to_microseconds_(prev_length)) * multiplier);
-        }
+        this->temp_.push_back((prev_level ? 1 : -1) * int32_t(prev_length) * multiplier);
       }
       prev_level = bool(item[i].level1);
       prev_length = item[i].duration1;
     }
   }
   if (prev_length > 0) {
-    if (prev_level) {
-      this->temp_.push_back(this->to_microseconds_(prev_length) * multiplier);
-    } else {
-      this->temp_.push_back(-int32_t(this->to_microseconds_(prev_length)) * multiplier);
-    }
+    this->temp_.push_back((prev_level ? 1 : -1) * int32_t(prev_length) * multiplier);
   }
 }
 
