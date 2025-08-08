@@ -30,7 +30,6 @@ void RemoteReceiverComponent::setup() {
       .clk_src = RMT_CLK_SRC_DEFAULT,
       .resolution_hz = 1'000'000,  // 1 tick = 1us
       .mem_block_symbols = 256,    // tune as needed
-      .invert_in = this->pin_->is_inverted(),
       .flags = {}
   };
 
